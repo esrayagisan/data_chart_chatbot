@@ -6,15 +6,11 @@ import psycopg2
 from decimal import Decimal
 from contextlib import contextmanager
 from openai import OpenAI
-# sentence_transformers artık default akışta kullanılmıyor (bkz. find_relevant_columns notu).
-# Tekrar açmak istersen: from sentence_transformers import SentenceTransformer, util
 
 
-# ---- Configuration ----
-# Ortam değişkeni verilmezse eski (yerel/localhost) davranış aynen devam
-# eder -- bu sayede Docker içinde çalışırken (localhost artık container'ın
-# kendisini işaret ettiği için) sadece env var vermek yeterli, kod
-# değişmiyor.
+# ============================================================
+# Configuration
+# ============================================================
 
 DB_CONFIG = {
     "host": os.environ.get("DWH_DB_HOST"),
@@ -29,25 +25,22 @@ SUPERSET_USERNAME = os.environ.get("SUPERSET_USERNAME")
 SUPERSET_PASSWORD = os.environ.get("SUPERSET_PASSWORD")
 DATASET_ID = int(os.environ.get("SUPERSET_DATASET_ID"))
 
+# Tables the generated SQL is allowed to touch. Anything else gets rejected.
 ALLOWED_TABLES = {
     "dim_customer", "dim_product", "dim_seller", "dim_date",
     "fact_order_items", "fact_order_payments"
 }
 
-# ---- Chart type spec'leri: her tipin gerçek Superset şemasına göre neye
-# ihtiyacı olduğunu tanımlar (bkz. line/bar/pie export JSON'ları) ----
-
+# Superset payload shape for each supported chart type.
 CHART_SPECS = {
     "line": {
         "viz_type": "echarts_timeseries_line",
-        "allowed_axis_roles": {"temporal"},   # line'da eksen sadece zaman olabilir
-        "metric_as_list": True,    # payload'da metrics: [metric]
+        "allowed_axis_roles": {"temporal"},
+        "metric_as_list": True,
         "supports_contribution": True,
     },
     "bar": {
         "viz_type": "echarts_timeseries_bar",
-        # bar hem kategori karşılaştırması ("kategoriye göre satış") hem de
-        # zaman bazlı gruplama ("aylık sipariş sayısı") için kullanılabilir
         "allowed_axis_roles": {"categorical", "temporal"},
         "metric_as_list": True,
         "supports_contribution": True,
@@ -55,23 +48,21 @@ CHART_SPECS = {
     "pie": {
         "viz_type": "pie",
         "allowed_axis_roles": {"categorical"},
-        "metric_as_list": False,   # payload'da tekil metric
-        "supports_contribution": False,  # pie zaten doğası gereği oran gösterir
+        "metric_as_list": False,
+        "supports_contribution": False,
     },
 }
 
 VALID_AGGREGATES = {"SUM", "AVG", "COUNT", "MIN", "MAX"}
-# category_filter_operator için whitelist. Superset'in adhoc_filters SIMPLE
-# clause'unda gerçekten bu düz string'lerle çalıştığı F12 Network export'u ile
-# doğrulandı (operatorId alanı frontend state'i için, backend zorunlu saymıyor).
 VALID_FILTER_OPERATORS = {"==", "!=", ">", "<", ">=", "<="}
 VALID_TIME_GRAINS = {"P1D", "P1W", "P1M", "P3M", "P1Y"}
 
 client = OpenAI(api_key=os.environ.get("DEEPSEEK_API_KEY"), base_url="https://api.deepseek.com")
-# embedding_model kaldırıldı: find_relevant_columns şu an kullanılmıyor.
 
 
-# ---- Database helpers ----
+# ============================================================
+# Database helpers
+# ============================================================
 
 @contextmanager
 def get_db_cursor():
@@ -85,6 +76,7 @@ def get_db_cursor():
 
 
 def fetch_data_catalog():
+    """Loads the metadata table that describes every question-able column."""
     with get_db_cursor() as cursor:
         cursor.execute(
             "SELECT friendly_name, source_table, source_column, description, join_info, dataset_id FROM data_catalog;"
@@ -98,18 +90,12 @@ def run_sql(sql):
         return cursor.fetchall()
 
 
-# ---- Schema retrieval ----
+# ============================================================
+# Schema retrieval
+# ============================================================
 
 def get_all_columns(catalog):
-    """
-    Embedding/cosine-similarity filtresi olmadan, data_catalog'daki TÜM satırları
-    relevant_columns ile aynı sözlük şekline çevirir. Şu an default akış bu.
-
-    Neden: threshold=0 + top_n=50 zaten kataloğun neredeyse tamamını LLM'e
-    gönderiyordu, yani eski find_relevant_columns fiilen filtre değil sadece
-    (kalitesiz) bir sıralama yapıyordu. Küçük bir katalogda (şu an ~43 satır)
-    doğrudan tamamını vermek daha basit ve en az o kadar isabetli.
-    """
+    """Converts raw data_catalog rows into a list of dicts the rest of the code uses."""
     return [
         {
             "friendly_name": row[0],
@@ -123,41 +109,8 @@ def get_all_columns(catalog):
     ]
 
 
-def find_relevant_columns(user_question, catalog, threshold=0, top_n=50):
-    """
-    DEVRE DIŞI (default akışta çağrılmıyor). Katalog büyüyüp tamamını LLM'e
-    vermek verimsizleştiğinde tekrar açmak için duruyor.
-
-    Açmak için: dosyanın başındaki sentence_transformers importunu ve
-    embedding_model satırını geri aç, answer_question içinde
-    get_all_columns(catalog) çağrısını bununla değiştir.
-    """
-    from sentence_transformers import SentenceTransformer, util
-    embedding_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-
-    embed_texts = [f"{row[0]}: {row[3]}" for row in catalog]  # row[3] = description
-    catalog_embeddings = embedding_model.encode(embed_texts, convert_to_tensor=True)
-    question_embedding = embedding_model.encode(user_question, convert_to_tensor=True)
-    similarities = util.cos_sim(question_embedding, catalog_embeddings)[0]
-
-    results = []
-    for idx, score in enumerate(similarities):
-        if score.item() >= threshold:
-            row = catalog[idx]
-            results.append({
-                "friendly_name": row[0],
-                "source_table": row[1],
-                "source_column": row[2],
-                "description": row[3],
-                "join_info": row[4],
-                "dataset_id": row[5],
-                "score": round(score.item(), 3)
-            })
-    results.sort(key=lambda x: -x["score"])
-    return results[:top_n]
-
-
 def build_schema_context(relevant_columns):
+    """Turns the column list into the text block the LLM prompts embed."""
     column_lines = [
         f"- Table: {c['source_table']} | Column: {c['source_column']} | Meaning: {c['friendly_name']} | {c['description']}"
         for c in relevant_columns
@@ -166,13 +119,12 @@ def build_schema_context(relevant_columns):
     return "\n".join(column_lines), "\n".join(join_lines) if join_lines else "None"
 
 
-# ---- Chart için kolon tipi zenginleştirme (information_schema tabanlı) ----
+# ============================================================
+# Column type enrichment (used for chart building)
+# ============================================================
 
 def get_column_types(relevant_columns):
-    """
-    (table, column) -> gerçek PostgreSQL data_type.
-    LLM'e isimden tip tahmin ettirmek yerine gerçek şemayı veriyoruz.
-    """
+    """Looks up each column's real PostgreSQL data type from information_schema."""
     tables_cols = {}
     for c in relevant_columns:
         tables_cols.setdefault(c["source_table"], set()).add(c["source_column"])
@@ -195,15 +147,13 @@ def get_column_types(relevant_columns):
 
 NUMERIC_SQL_TYPES = ("integer", "bigint", "numeric", "double precision", "real", "smallint")
 
-# Bazı kolonlar veritabanında integer/smallint olarak saklanır ama anlamsal
-# olarak toplanacak/ortalanacak bir DEĞER değil, bir GRUPLAMA/KATEGORİdir
-# (örn. dim_date.quarter: 1/2/3/4 -- SUM(quarter) anlamsız, ama "çeyreğe göre
-# satış" gibi bir axis olarak kullanılabilir). Bunları classify_column'da
-# "numeric" yerine "categorical" sayıyoruz.
+# Integer columns that are actually categories/groupings, not summable values
+# (e.g. dim_date.quarter is 1/2/3/4 -- useful as an axis, meaningless to SUM).
 CATEGORICAL_INT_COLUMNS = {"year", "quarter", "month", "day", "day_of_week"}
 
 
 def classify_column(data_type, column_name=None):
+    """Maps a SQL type + column name to one of: temporal / numeric / categorical."""
     if data_type in ("date", "timestamp", "timestamp without time zone", "timestamptz"):
         return "temporal"
     if column_name in CATEGORICAL_INT_COLUMNS:
@@ -214,6 +164,7 @@ def classify_column(data_type, column_name=None):
 
 
 def enrich_columns(relevant_columns):
+    """Adds data_type and role (temporal/numeric/categorical) to each column."""
     type_map = get_column_types(relevant_columns)
     enriched = []
     for c in relevant_columns:
@@ -223,15 +174,15 @@ def enrich_columns(relevant_columns):
     return enriched
 
 
-# ---- Time range validation ----
+# ============================================================
+# Time range validation
+# ============================================================
 
 def is_valid_time_range(time_range):
     """
-    Kabul edilen format: "START : END", START/END her biri boş ya da
-    YYYY-MM-DD olabilir (ikisi birden boş olamaz). Superset'in
-    TEMPORAL_RANGE comparator'ının gerçek gösterim şekli bu (F12 ile
-    doğrulandı: kapalı "2017-01-01 : 2018-01-01", sadece-alt
-    "2017-01-01 : ", sadece-üst " : 2018-01-01").
+    Accepted format: "START : END", where START/END are each either empty
+    or YYYY-MM-DD (both empty is not allowed). Matches Superset's
+    TEMPORAL_RANGE filter format.
     """
     if " : " not in time_range:
         return False
@@ -242,7 +193,9 @@ def is_valid_time_range(time_range):
     return bool(start_ok and end_ok and (start != "" or end != ""))
 
 
-# ---- SQL safety ----
+# ============================================================
+# SQL safety
+# ============================================================
 
 def is_select_only(sql):
     return sql.strip().upper().startswith("SELECT")
@@ -254,6 +207,7 @@ def extract_table_names(sql):
 
 
 def is_sql_safe(sql, allowed_tables=ALLOWED_TABLES):
+    """Rejects anything that isn't a plain SELECT over the whitelisted tables."""
     if not is_select_only(sql):
         return False, "Only SELECT queries are allowed."
     disallowed = extract_table_names(sql) - allowed_tables
@@ -262,7 +216,9 @@ def is_sql_safe(sql, allowed_tables=ALLOWED_TABLES):
     return True, "Safe."
 
 
-# ---- Result formatting ----
+# ============================================================
+# Result formatting
+# ============================================================
 
 def format_results(rows, limit=10):
     lines = []
@@ -279,7 +235,9 @@ def format_results(rows, limit=10):
     return "\n".join(lines)
 
 
-# ---- SQL answer path ----
+# ============================================================
+# SQL answer path: user question -> SQL -> result text
+# ============================================================
 
 def answer_with_sql(user_question, relevant_columns):
     columns_summary, joins_summary = build_schema_context(relevant_columns)
@@ -309,7 +267,7 @@ Question: {user_question}
     response = client.chat.completions.create(
         model="deepseek-chat",
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.1,  # yapısal/deterministik çıktı için -- rastgelelik azaltılıyor
+        temperature=0.1,
     )
     answer = response.choices[0].message.content.strip()
 
@@ -330,9 +288,12 @@ Question: {user_question}
     return f"{explanation}\n\n{format_results(rows)}"
 
 
-# ---- Chart answer path ----
+# ============================================================
+# Chart answer path: user question -> chart type -> chart params -> Superset + PNG
+# ============================================================
 
 def determine_chart_type(user_question):
+    """Asks the LLM to pick "bar", "line" or "pie" for the question."""
     prompt = f"""
 Determine the most appropriate chart type for the user's request.
 Respond ONLY with one word: "bar", "line", or "pie".
@@ -353,7 +314,10 @@ User request: {user_question}
 
 def determine_chart_params(user_question, chart_type, relevant_columns):
     """
-    Tek, chart_type'a göre dallanan parametre üretici (line/bar/pie hepsi burada).
+    Asks the LLM to pick axis/metric/filter columns and settings for the
+    given chart_type, constrained to the columns actually available.
+    Returns (chart_params dict, enriched columns) -- chart_params is
+    untrusted until it passes is_chart_params_safe.
     """
     if chart_type not in CHART_SPECS:
         raise ValueError(f"Bilinmeyen chart_type: {chart_type}")
@@ -483,6 +447,11 @@ Kullanıcı isteği: {user_question}
 
 
 def is_chart_params_safe(chart_type, chart_params, enriched_columns):
+    """
+    Validates every field the LLM produced in determine_chart_params against
+    the actual column roles/types and the fixed whitelists above. Nothing
+    from chart_params reaches Superset or SQL generation before passing this.
+    """
     spec = CHART_SPECS[chart_type]
     by_name = {c["source_column"]: c for c in enriched_columns}
 
@@ -496,9 +465,6 @@ def is_chart_params_safe(chart_type, chart_params, enriched_columns):
             f"'{axis_col}' rolü: {axis_role}"
         )
 
-    # time_grain, chart tipine değil axis_column'un GERÇEK rolüne bağlı:
-    # bar'da axis temporal seçilmişse (örn. "aylık sipariş sayısı") zorunlu,
-    # axis categorical seçilmişse (örn. "kategoriye göre satış") kullanılmaz.
     if axis_role == "temporal":
         if chart_params.get("time_grain") not in VALID_TIME_GRAINS:
             return False, f"time_grain geçersiz: {chart_params.get('time_grain')}"
@@ -525,8 +491,6 @@ def is_chart_params_safe(chart_type, chart_params, enriched_columns):
     if time_range != "No filter" and not is_valid_time_range(time_range):
         return False, f"time_range geçersiz format: {time_range}"
 
-    # Kategorik/sayısal filtre (örn. "health_beauty kategorisi",
-    # "year > 2017") -- opsiyonel.
     category_filter_col = chart_params.get("category_filter_column")
     category_filter_op = chart_params.get("category_filter_operator")
     category_filter_val = chart_params.get("category_filter_value")
@@ -539,9 +503,8 @@ def is_chart_params_safe(chart_type, chart_params, enriched_columns):
         if category_filter_op not in VALID_FILTER_OPERATORS:
             return False, f"category_filter_operator geçersiz: {category_filter_op}"
 
-        # inequality operatörleri sadece sayısal-ama-categorical kolonlarda
-        # anlamlı (örn. year, quarter). Metinsel kategori kolonunda ">"
-        # anlamsız/hatalı olur.
+        # Inequality operators only make sense on numeric-looking categorical
+        # columns (year, quarter, ...), not on free-text categories.
         if category_filter_op not in ("==", "!=") and category_filter_col not in CATEGORICAL_INT_COLUMNS:
             return False, (
                 f"'{category_filter_op}' operatörü sadece sayısal kolonlarda "
@@ -551,22 +514,15 @@ def is_chart_params_safe(chart_type, chart_params, enriched_columns):
         if isinstance(category_filter_val, str):
             if not category_filter_val.strip():
                 return False, "category_filter_value boş olamaz"
-            # Superset filtreyi parametreli olarak kendi kuruyor (raw SQL
-            # string birleştirme değil), yine de savunma amaçlı basit bir
-            # sağlamlık kontrolü: tırnak/noktalı virgül/SQL anahtar kelimesi
-            # içermesin.
+            # Superset builds the filter parametrically, but reject anything
+            # SQL-injection-shaped anyway as defense in depth.
             if re.search(r"[;'\"]|--|\b(DROP|DELETE|INSERT|UPDATE|UNION|SELECT)\b",
                           category_filter_val, re.IGNORECASE):
                 return False, f"category_filter_value şüpheli içerik barındırıyor: {category_filter_val}"
 
-            # DB'de gerçekten integer olan (CATEGORICAL_INT_COLUMNS) bir
-            # kolon için LLM'in değeri "2017" gibi tırnaklı STRING dönmesi
-            # mümkün (JSON'da hangi tipte üreteceği garanti değil). Bu
-            # durumda değeri buradan itibaren gerçek int'e çeviriyoruz --
-            # aksi halde Superset'e string "2017" gider, year kolonu
-            # integer olduğu için sessiz tip uyuşmazlığı/yanlış filtre
-            # riski oluşur. Sayıya çevrilemiyorsa (örn. "twenty-seventeen")
-            # açıkça reddediyoruz.
+            # LLM sometimes returns a numeric categorical value (e.g. year)
+            # as a quoted string -- coerce it to int so Superset doesn't get
+            # a type mismatch.
             if category_filter_col in CATEGORICAL_INT_COLUMNS:
                 try:
                     category_filter_val = int(category_filter_val)
@@ -582,14 +538,10 @@ def is_chart_params_safe(chart_type, chart_params, enriched_columns):
         else:
             return False, f"category_filter_value geçersiz tip: {type(category_filter_val)}"
 
-    # Agregasyon SONRASI (HAVING) filtre -- örn. "toplam satışı 10000'i geçen
-    # kategoriler". category_filter'dan farklı olarak burada eşik gruplanmış
-    # metriğe uygulanır. Superset'in HAVING alanı ham SQL (sqlExpression)
-    # bekliyor (F12 ile doğrulandı: Simple modda HAVING seçeneği bile yok,
-    # Superset kendisi "Custom SQL" kullanmayı dayatıyor) -- bu yüzden LLM'e
-    # asla sqlExpression'ı kendisi yazdırmıyoruz, sadece operator + value
-    # alıyoruz ve ifadeyi build_chart_payload'da zaten whitelist'ten geçmiş
-    # aggregate/metric_column değerlerinden biz kendimiz inşa ediyoruz.
+    # Post-aggregation (HAVING) threshold, e.g. "categories with total sales
+    # over 10000". Only operator + value are taken from the LLM -- the actual
+    # SQL expression is built later from already-whitelisted aggregate/column
+    # values, never from free text.
     metric_filter_op = chart_params.get("metric_filter_operator")
     metric_filter_val = chart_params.get("metric_filter_value")
     if metric_filter_op is not None or metric_filter_val is not None:
@@ -608,23 +560,17 @@ def is_chart_params_safe(chart_type, chart_params, enriched_columns):
     return True, "Safe."
 
 
-# ---- Dataset resolution ----
-# data_catalog'daki her satır opsiyonel olarak bir Superset dataset_id'sine
-# bağlanabilir (örn. item-level fact_order_items -> dataset 22, order-level
-# aggregate fact_order_payments -> dataset 23). Bu ALAN OPSİYONEL: tek
-# dataset kullanan biri hiç doldurmaz, hepsi NULL kalır ve sistem eskisi
-# gibi tek DATASET_ID (.env) üzerinden çalışmaya devam eder.
+# ============================================================
+# Dataset resolution
+# ============================================================
 
 def resolve_dataset_id(chart_params, enriched_columns, default_dataset_id=DATASET_ID):
     """
-    chart_params içinde kullanılan kolonların (axis, metric, filtreler)
-    hangi Superset dataset_id'sine ait olduğunu data_catalog'dan bulur.
-
-    - Hiçbir kolon dataset_id taşımıyorsa (hepsi NULL) -> default_dataset_id.
-    - Kullanılan kolonlar tek/aynı bir dataset_id'ye aitse -> onu döner.
-    - Farklı dataset_id'ler karışmışsa -> ValueError fırlatır (LLM tek
-      chart'ta birleştirilemeyecek granülaritedeki kolonları karıştırmış
-      demektir, bunu sessizce yanlış sonuç üretmek yerine reddediyoruz).
+    Figures out which Superset dataset_id the chart's columns belong to,
+    using the optional dataset_id column in data_catalog. Falls back to
+    default_dataset_id if none of the used columns specify one, and raises
+    if the used columns span more than one dataset (can't combine them into
+    a single chart).
     """
     used_cols = {chart_params.get("axis_column"), chart_params.get("time_filter_column")}
     if chart_params.get("metric_type") == "column":
@@ -650,6 +596,10 @@ def resolve_dataset_id(chart_params, enriched_columns, default_dataset_id=DATASE
     )
 
 
+# ============================================================
+# Superset chart payload
+# ============================================================
+
 def build_metric(chart_params):
     if chart_params["metric_type"] == "count":
         return "count"
@@ -670,9 +620,9 @@ def get_axis_info(axis_col, enriched_columns):
 
 def build_chart_payload(chart_type, chart_params, enriched_columns, dataset_id, chart_name):
     """
-    Tek, chart_type'a göre dallanan payload üretici (line/bar/pie hepsi burada).
-    Kozmetik/stil alanları (renk, legend, donut ayarları vb.) LLM'e sordurulmuyor,
-    burada sabit makul defaultlarla kuruluyor.
+    Builds the Superset /api/v1/chart/ request body for line/bar/pie from
+    already-validated chart_params. Cosmetic settings (colors, legend, ...)
+    are fixed sane defaults here, not something the LLM decides.
     """
     spec = CHART_SPECS[chart_type]
     metric = build_metric(chart_params)
@@ -704,21 +654,13 @@ def build_chart_payload(chart_type, chart_params, enriched_columns, dataset_id, 
             "expressionType": "SIMPLE",
         })
 
-    # HAVING (agregasyon sonrası metrik eşiği), örn. "SUM(price) > 10000".
-    # Superset'in HAVING alanı Simple modda bile yok, sadece ham SQL
-    # (sqlExpression) kabul ediyor (F12 ile doğrulandı) -- bu yüzden
-    # sqlExpression'ı LLM'den gelen serbest metinle DEĞİL, zaten
-    # is_chart_params_safe'te whitelist'ten geçmiş aggregate/metric_column
-    # değerlerinden burada kendimiz inşa ediyoruz. metric_filter_operator
-    # VALID_FILTER_OPERATORS'tan, metric_filter_value ise sayısal olduğu
-    # doğrulanmış -- yani bu string'e LLM'in ürettiği hiçbir serbest metin
-    # karışmıyor.
+    # Superset's Simple filter mode has no HAVING option, so a post-aggregation
+    # threshold has to be sent as a raw SQL expression. It's built here from
+    # already-whitelisted aggregate/metric_column values only.
     metric_filter_op = chart_params.get("metric_filter_operator")
     metric_filter_val = chart_params.get("metric_filter_value")
     if metric_filter_op and metric_filter_val is not None:
         if chart_params["metric_type"] == "count":
-            # count metriğinde aggregate/metric_column None'dır (spec gereği),
-            # bu yüzden standart SQL COUNT(*) ifadesini kullanıyoruz.
             having_expr = f"COUNT(*) {metric_filter_op} {metric_filter_val}"
         else:
             having_expr = (
@@ -759,55 +701,28 @@ def build_chart_payload(chart_type, chart_params, enriched_columns, dataset_id, 
             "rich_tooltip": True,
             "tooltipTimeFormat": "smart_date",
             "x_axis_sort_asc": chart_params.get("sort_ascending", False),
-            # order_desc, sorgunun VERİTABANI SEVİYESİNDE (row_limit ile
-            # birlikte "top N" satır SEÇİMİ için) hangi yönde sıralanacağını
-            # belirler -- x_axis_sort_asc ise SADECE post_processing'teki
-            # GÖRÜNTÜLEME sırasını kontrol eder. İkisi prensipte bağımsızdır.
-            # "not sort_ascending" eşitlemesi şu an güvenli çünkü row_limit
-            # (10000) gerçek kategori sayısından kat kat büyük -- yani
-            # order_desc'in satır SEÇME işlevi hiç devreye girmiyor, sadece
-            # doldurulması gereken bir alan. limit/timeseries_limit_metric
-            # (series limit / "top N") eklendiğinde row_limit gerçekten
-            # satır elemeye başlayacak; o noktada bu coupling YANLIŞ olur --
-            # örn. "en çok satan 10 kategoriyi küçükten büyüğe sırala" gibi
-            # bir istekte seçim (descending) ile görüntüleme (ascending) zıt
-            # yönde olmalı. O zaman bu satır kaldırılıp order_desc ayrı bir
-            # kararla (ya da sabit "her zaman descending seç" kuralıyla)
-            # ele alınmalı.
             "order_desc": not chart_params.get("sort_ascending", False),
         })
-        # time_grain, chart_type'a değil axis'in GERÇEK rolüne bağlı: bar'da
-        # axis temporal seçildiyse ("aylık sipariş sayısı") de gerekli.
         if axis_role == "temporal":
             params["time_grain_sqla"] = chart_params["time_grain"]
 
-        # xAxisForceCategorical: axis_column DB'de sayısal (integer/smallint)
-        # ama bizim sınıflandırmamızda categorical ise (örn. dim_date.quarter:
-        # 1/2/3/4 -- toplanacak bir değer değil, bir gruplama), Superset'e
-        # bunu sürekli/numeric eksen değil ayrık kategori olarak çizdirtiyoruz.
-        # LLM'e sorulmuyor -- axis_column zaten belli, tipi de DB'den biliniyor.
+        # If axis_column is numeric in the DB but categorical in our
+        # classification (e.g. dim_date.quarter), force Superset to draw it
+        # as discrete categories instead of a continuous numeric axis.
         if axis_role == "categorical" and axis_info["data_type"] in NUMERIC_SQL_TYPES:
             params["xAxisForceCategorical"] = True
 
         if chart_type == "bar":
             params["orientation"] = "vertical"
-            # x_axis_sort (metrik büyüklüğüne göre sıralama) SADECE axis
-            # categorical iken anlamlı ("en çok satan kategori önce" gibi).
-            # axis temporal ise ("aylık sipariş sayısı") bunu eklemiyoruz,
-            # yoksa Superset ayları kronolojik sırada değil metrik büyüklüğüne
-            # göre dizer -- sessizce yanlış/yanıltıcı bir grafik üretir.
+            # Sorting by metric size only makes sense for a categorical axis;
+            # a temporal axis must stay chronological.
             if axis_role == "categorical":
                 sort_metric_label = "count" if metric == "count" else metric["label"]
                 params["x_axis_sort"] = sort_metric_label
 
-        # contribution_mode: kullanıcı "pay/yüzde/oranı" istediyse Superset'e
-        # her axis değerinin toplam içindeki payını hesaplattırıyoruz.
-        # NOT: "column" seçimi veriye/soruya göre değil, pivot YAPIMIZA göre
-        # sabit doğru: groupby her zaman [] olduğu için pivot tek kolonlu,
-        # bu şekilde "row" hep %100 (anlamsız), "column" hep gerçek pay verir.
-        # Bu varsayım groupby boş kaldığı sürece geçerli -- ileride çoklu-boyut
-        # (groupby dolu) desteği eklenirse bu mantık YENİDEN değerlendirilmeli,
-        # o yüzden burada sessizce yanlış sonuç üretmek yerine hata veriyoruz.
+        # contributionMode="column" is correct as long as groupby stays
+        # empty (single-column pivot) -- if multi-dimension grouping is
+        # added later this needs to be revisited.
         if spec.get("supports_contribution") and chart_params.get("contribution_mode") == "share_of_total":
             if params["groupby"]:
                 raise ValueError(
@@ -854,21 +769,16 @@ def superset_login():
     return session
 
 
-# ---- Yerel (Superset'siz) chart üretimi ----
+# ============================================================
+# Local (Superset-independent) chart rendering
+# ============================================================
 #
-# Superset chart'ı, JOIN mantığını kendi içindeki "virtual dataset"te
-# (DATASET_ID) tutuyor -- Python kodu bu JOIN'leri bilmiyor. Superset açık/
-# kurulu olmayan bir kullanıcı için de grafiği gösterip indirtebilmek adına,
-# aynı chart_params'tan (zaten is_chart_params_safe'ten geçmiş, whitelist'li)
-# bağımsız bir SQL sorgusu üretip PostgreSQL'e doğrudan soruyoruz.
-#
-# JOIN'leri Python'da elle sabit kodlamak yerine (gerçek foreign-key kolon
-# adları elimizde net olmadığı için) answer_with_sql'de zaten kanıtlanmış
-# çalışan yöntemi tekrar kullanıyoruz: LLM'e join_info'yu vererek SQL
-# yazdırıyoruz -- ama LLM'e YORUMLAMA alanı bırakmıyoruz, sadece ZATEN
-# belirlenmiş (axis/metric/filtre) parametreleri SQL sözdizimine çevirmesini
-# istiyoruz. Üretilen SQL yine is_sql_safe'ten geçmek zorunda -- aynı
-# whitelist savunması burada da geçerli.
+# Superset resolves joins internally via its virtual dataset, which Python
+# has no direct access to. To render a chart even when Superset is
+# unreachable, the same validated chart_params are turned into a plain SQL
+# query (via the LLM, but with no room left to reinterpret anything -- it
+# only translates already-fixed parameters into syntax) and run directly
+# against PostgreSQL. The result is drawn locally with matplotlib.
 
 def build_chart_query_sql(chart_params, columns_summary, joins_summary):
     prompt = f"""
@@ -926,9 +836,9 @@ Join info:
 
 def run_chart_query(chart_params, relevant_columns):
     """
-    chart_params'ın ZATEN is_chart_params_safe'ten geçmiş olması bekleniyor
-    -- burada ayrıca is_sql_safe ile üretilen SQL'in kendisi de doğrulanıyor
-    (defense-in-depth: hem parametreler hem üretilen SQL whitelist'ten geçiyor).
+    Expects chart_params to have already passed is_chart_params_safe.
+    The SQL generated from it is checked again with is_sql_safe as a second
+    line of defense.
     """
     columns_summary, joins_summary = build_schema_context(relevant_columns)
     sql = build_chart_query_sql(chart_params, columns_summary, joins_summary)
@@ -942,12 +852,9 @@ def run_chart_query(chart_params, relevant_columns):
 
 
 def render_chart_png(chart_type, rows, axis_label, metric_label):
-    """
-    SQL sonucundan (rows: [(axis_value, metric_value), ...]) bir PNG üretir.
-    Superset'e hiç bağımlı değil -- matplotlib gerekir (pip install matplotlib).
-    """
+    """Renders SQL result rows [(axis_value, metric_value), ...] to a PNG buffer."""
     import matplotlib
-    matplotlib.use("Agg")  # ekran/GUI gerektirmeyen backend
+    matplotlib.use("Agg")
     import matplotlib.pyplot as plt
     import io
 
@@ -975,6 +882,7 @@ def render_chart_png(chart_type, rows, axis_label, metric_label):
 
 
 def answer_with_chart(user_question, relevant_columns):
+    """CLI-facing chart flow: returns a plain text answer with the Superset link."""
     chart_type = determine_chart_type(user_question)
     chart_params, enriched = determine_chart_params(user_question, chart_type, relevant_columns)
 
@@ -999,12 +907,11 @@ def answer_with_chart(user_question, relevant_columns):
 
 def answer_with_chart_full(user_question, relevant_columns):
     """
-    answer_with_chart'ın Streamlit için genişletilmiş hali -- düz metin
-    yerine, arayüzün ihtiyaç duyduğu her parçayı (hata mesajı / Superset
-    linki / yerel PNG buffer) ayrı ayrı bir sözlükte döner. Superset chart'ı
-    oluşturma adımı burada da opsiyonel: erişilemiyorsa (bağlantı hatası
-    vb.) yerel PNG yine de üretilmeye çalışılır -- kullanıcı Superset'e
-    hiç erişemese bile grafiği görüp indirebilsin diye.
+    Streamlit-facing version of answer_with_chart: instead of one text
+    string, returns a dict with every piece the UI needs separately
+    (error / Superset link / local PNG buffer / SQL / warning).
+    Saving to Superset is optional -- if it's unreachable, the local PNG is
+    still attempted so the user can see and download the chart regardless.
     """
     chart_type = determine_chart_type(user_question)
     chart_params, enriched = determine_chart_params(user_question, chart_type, relevant_columns)
@@ -1022,10 +929,6 @@ def answer_with_chart_full(user_question, relevant_columns):
         "warning": None,
     }
 
-    # Superset'e kaydetmeyi dene (opsiyonel -- başarısız olursa yerel PNG'yi
-    # engellemesin). dataset_id çözümlemesi de bu try içinde: farklı
-    # dataset'lere ait kolonlar karışmışsa bu da bir "Superset'e kaydedemedim"
-    # durumu olarak ele alınıp yerel PNG akışına düşülür.
     try:
         dataset_id = resolve_dataset_id(chart_params, enriched)
         session = superset_login()
@@ -1039,7 +942,6 @@ def answer_with_chart_full(user_question, relevant_columns):
     except Exception as e:
         result["warning"] = f"Superset'e ulaşılamadı ({e}) -- sadece yerel grafik gösteriliyor."
 
-    # Yerel SQL + PNG (Superset'ten bağımsız)
     try:
         rows, sql = run_chart_query(chart_params, relevant_columns)
         result["sql"] = sql
@@ -1058,7 +960,9 @@ def answer_with_chart_full(user_question, relevant_columns):
     return result
 
 
-# ---- Main entry point ----
+# ============================================================
+# Main entry point (CLI)
+# ============================================================
 
 def answer_question(user_question, want_chart):
     catalog = fetch_data_catalog()

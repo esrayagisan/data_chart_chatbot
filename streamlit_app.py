@@ -12,7 +12,7 @@ Chart isteklerinde iki şey birden üretilir:
 """
 
 import streamlit as st
-from chatbot2 import (
+from chatbot import (
     fetch_data_catalog,
     get_all_columns,
     answer_with_sql,
