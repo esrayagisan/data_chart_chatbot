@@ -51,8 +51,8 @@ streamlit run streamlit_app.py
 ### Docker ile çalıştırma
 
 ```bash
-docker build -t olist-chatbot .
-docker run -p 8501:8501 --env-file .env olist-chatbot
+docker build -t data-chatbot .
+docker run -p 8501:8501 --env-file .env data-chatbot
 ```
 
 ## Gerekli ortam değişkenleri

@@ -4,9 +4,9 @@ WORKDIR /app
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
-#copy chatbot'tan önce: her kod değişikliğinde tekrar çalışmıyor, yalnızca req değişince
+#copy data_chatbot'tan önce: her kod değişikliğinde tekrar çalışmıyor, yalnızca req değişince
 
-COPY chatbot.py .
+COPY data_chatbot.py .
 COPY streamlit_app.py .
 
 EXPOSE 8501

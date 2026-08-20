@@ -21,14 +21,18 @@ DB_CONFIG = {
 }
 
 SUPERSET_URL = os.environ.get("SUPERSET_URL", "http://localhost:8088")
+# Ayrı bir "genel/tarayıcı" adresi -- SUPERSET_URL container'ın Superset'e API
+# çağrıları için kullandığı adres (örn. host.docker.internal), bu ise
+# kullanıcıya gösterilen linkte kullanılan, tarayıcıdan erişilebilen adres
+# (örn. localhost). Verilmezse SUPERSET_URL ile aynı kabul edilir.
+SUPERSET_PUBLIC_URL = os.environ.get("SUPERSET_PUBLIC_URL", SUPERSET_URL)
 SUPERSET_USERNAME = os.environ.get("SUPERSET_USERNAME")
 SUPERSET_PASSWORD = os.environ.get("SUPERSET_PASSWORD")
 DATASET_ID = int(os.environ.get("SUPERSET_DATASET_ID"))
 
 # Tables the generated SQL is allowed to touch. Anything else gets rejected.
 ALLOWED_TABLES = {
-    "dim_customer", "dim_product", "dim_seller", "dim_date",
-    "fact_order_items", "fact_order_payments"
+    "dim_customer", "dim_product", "dim_seller", "dim_date", "fact_order_items"
 }
 
 # Superset payload shape for each supported chart type.
@@ -901,7 +905,7 @@ def answer_with_chart(user_question, relevant_columns):
     result = response.json()
 
     if "id" in result:
-        return f"Chart oluşturuldu: {SUPERSET_URL}/explore/?slice_id={result['id']}"
+        return f"Chart oluşturuldu: {SUPERSET_PUBLIC_URL}/explore/?slice_id={result['id']}"
     return f"⚠️ Chart oluşturulamadı: {result}"
 
 
@@ -936,7 +940,7 @@ def answer_with_chart_full(user_question, relevant_columns):
         response = session.post(f"{SUPERSET_URL}/api/v1/chart/", json=payload)
         superset_result = response.json()
         if "id" in superset_result:
-            result["superset_url"] = f"{SUPERSET_URL}/explore/?slice_id={superset_result['id']}"
+            result["superset_url"] = f"{SUPERSET_PUBLIC_URL}/explore/?slice_id={superset_result['id']}"
         else:
             result["warning"] = f"Superset chart'ı oluşturulamadı: {superset_result}"
     except Exception as e:
